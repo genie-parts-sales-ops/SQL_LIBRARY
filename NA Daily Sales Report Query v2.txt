@@ -1,0 +1,163 @@
+--V2 Updated 5/7/2020 by DM; Now pulls OKC drop-ship lines
+
+WITH orgs AS (
+    SELECT organization_id, organization_code 
+    FROM inv.mtl_parameters 
+    WHERE organization_code in ('728','733','734','735')
+),
+--Customer subquery
+cust AS (
+      SELECT DISTINCT HP.PARTY_NAME SHIP_TO_CUSTOMER, HL.COUNTRY, HCSU.SITE_USE_ID,HL.ADDRESS1 SHIP_TO_ADDRESS1, HL.ADDRESS2 SHIP_TO_ADDRESS2,HL.ADDRESS4 SHIP_TO_ADDRESS4
+             ,HL.CITY SHIP_TO_CITY, NVL(HL.STATE, HL.Province) SHIP_TO_STATE, HL.POSTAL_CODE SHIP_TO_POSTAL_CODE,HL.COUNTRY SHIP_TO_COUNTRY
+             ,HCA.ACCOUNT_NUMBER CUSTOMER_ACCOUNT_NUMBER, HCA.CUST_ACCOUNT_ID 
+       FROM   AR.HZ_CUST_SITE_USES_ALL HCSU                                                                                                                                                                                                                                                                            
+         JOIN   APPS.HZ_CUST_ACCT_SITES_ALL HCAS ON HCSU.CUST_ACCT_SITE_ID = HCAS.CUST_ACCT_SITE_ID                                                                                          
+         JOIN   APPS.HZ_CUST_ACCOUNTS HCA ON  HCAS.CUST_ACCOUNT_ID = HCA.CUST_ACCOUNT_ID                                                                                                   
+         JOIN   APPS.HZ_PARTIES HP ON HCA.PARTY_ID = HP.PARTY_ID                                                                                                                                                                                                          
+         JOIN   APPS.HZ_PARTY_SITES HPS ON HCAS.PARTY_SITE_ID = HPS.PARTY_SITE_ID                                                                                                                                                   
+         JOIN   APPS.HZ_LOCATIONS HL ON HPS.LOCATION_ID = HL.LOCATION_ID                                                                                                                                                                    
+       WHERE  1 = 1                                                                                                                                                                                                                                                                                                                                                               
+          AND    HCSU.SITE_USE_CODE = 'SHIP_TO'
+          and hca.customer_type = 'R'
+),
+fx AS (
+    SELECT DISTINCT currency_conversion_rate rate, der.currency_conversion_date conv_date
+      FROM   apps.glfg_gl_daily_exchange_rates der
+      WHERE from_currency = 'EUR'
+      and to_currency = 'USD'
+      and currency_conversion_type_code = 'Corporate'
+      and der.currency_conversion_date > '01-JAN-2017'
+)
+,oot as (
+    SELECT transaction_type_id, name
+    from ONT.oe_transaction_types_tl
+    where language = 'US'
+)
+
+--edit this section to filter for customer, part or date range
+,cms1 AS (
+    SELECT sold_to_customer_name customer_name
+          ,order_number 
+          ,invoiced_amount
+          ,invoice_quantity
+          ,gl_date
+          ,customer_trx_line_id
+          ,parent_inventory_item_id
+          ,ship_to_site_use_id  
+          ,parent_organization_id
+          ,parent_line_id
+          ,customer_id
+          ,order_type_id
+    FROM   bom.cst_margin_summary cms1a
+    WHERE  1 = 1
+    AND    legal_entity_id = 11022 
+    AND    gl_date BETWEEN trunc(sysdate-1,'month') AND (sysdate - 1)
+    AND    cogs_amount is null
+    AND    source IN ('INVOICE','RMA-INVOICE')
+    AND    order_type_id IN (1670,1671,1311,1770)
+    AND    parent_organization_id IN ('16117','21415','21416','28070', '8322') --'16117','28070','21415','21416','21417'
+    and    customer_id NOT IN (2182328,3622101,13106751,17881259,18720283)  --Terex Utilities [2182328 17881259] wheco [18720283] Symmetry [13106751] Singapore Terex [3622101]
+)
+,cms2 AS (
+    SELECT a.parent_line_id
+          ,SUM(nvl(a.cogs_amount,0)) cogs_amount
+    FROM   bom.cst_margin_summary a
+    where exists (select 1 from cms1 where cms1.parent_line_id = a.parent_line_id)
+    GROUP BY  a.parent_line_id
+)
+,cms AS (
+    SELECT cms1.customer_name
+          ,cms1.order_number 
+          ,sum(cms1.invoiced_amount) invoiced_amount
+          ,sum(nvl(cms1.invoice_quantity,0)) invoiced_quantity
+          ,cms2.cogs_amount cogs
+          ,cms1.gl_date
+          ,cms1.customer_trx_line_id
+          ,cms1.parent_inventory_item_id inventory_item_id
+          ,cms1.ship_to_site_use_id  
+          ,cms1.parent_organization_id
+          ,cms1.customer_id
+          ,cms1.order_type_id
+    FROM   cms1
+    LEFT JOIN 
+           cms2 ON cms1.parent_line_id = cms2.parent_line_id
+    WHERE  1 = 1
+    GROUP BY cms1.parent_line_id
+            ,cms1.order_number  
+            ,cms1.customer_name
+            ,cms1.gl_date
+            ,cms1.customer_trx_line_id
+            ,cms1.parent_inventory_item_id
+            ,cms1.ship_to_site_use_id  
+            ,cms1.parent_organization_id
+            ,cms1.customer_id
+            ,cms1.order_type_id
+            ,cms2.cogs_amount
+)
+,msi AS (
+    SELECT DISTINCT 
+           msib.organization_id
+          ,msib.inventory_item_id
+          ,msib.segment1
+          ,msib.description
+          ,regexp_substr (aic.description, '[^.]+',1, 1) AS Master_Class
+          ,NVL(regexp_substr (aic.description, '[^.]+',1, 2), 'Unassigned') AS Item_Class
+          ,NVL(regexp_substr (aic.description, '[^.]+',1, 3), 'Unassigned') AS Sub_Class
+    FROM   inv.mtl_system_items_b msib
+    JOIN   apps.invfg_item_category_asgns iica ON msib.inventory_item_id = iica.inventory_item_id
+                                              AND msib.organization_id = iica.organization_id
+                                              and iica.category_set_id = 1100000021
+    JOIN   apps.invfg_item_category_asgns iica2 on iica.inventory_item_id = iica2.inventory_item_id
+                                               and iica.organization_id = iica2.organization_id
+                                               and iica2.category_set_id = 1100000022
+    JOIN   apps.invfg_item_categories aic ON aic.category_id = iica.category_id
+    where  1 = 1
+    and    iica2.product_family_2 = 'AERIAL WORK PLATFORMS'
+    and    msib.segment1 <> 'FREIGHT'
+    AND    msib.organization_id IN ('21415','21416','21417','16117','28070', '8322')
+) 
+
+SELECT 
+       cms.customer_name
+      ,cust.customer_account_number
+      ,cust.ship_to_city
+      ,cust.ship_to_state
+      ,cust.ship_to_country
+      ,cms.parent_organization_id
+      ,cms.order_number  
+      ,oot.name order_type
+      ,msi.segment1 Item_number
+      ,msi.description
+      ,to_char(gl_date,'mm/dd/yyyy') gl_date
+      ,cms.invoiced_quantity
+      ,trxl.unit_standard_price List_Price
+      ,round(cms.invoiced_amount * fx.rate, 2) invoiced_amount     
+      ,round(cms.cogs * fx.rate, 2) cogs
+      ,round(1-(trxl.unit_selling_price/nullif(trxl.unit_standard_price,0)),2) "Discount Percentage"
+      ,round((cms.invoiced_amount - cms.cogs)/nullif(invoiced_amount,0),6) "Margin"
+      ,msi.master_class
+      ,msi.item_class
+      ,msi.sub_class
+      ,CASE WHEN cust.ship_to_state IN ('IL','IN','MI','OH','ON','WI','KY')
+                THEN 'Midwest'
+            WHEN cust.ship_to_state IN ('IA','KS','MN','MO','ND','NE','SD','AR','LA','OK', 'TN')
+                THEN 'Central'
+            WHEN cust.ship_to_state IN ('CT','DC','DE','MA','MD','ME','NB','NH','NJ','NL','NS','NY','PA','PE','QC','RI','VA','VT','WV')
+                THEN 'Northeast'
+            WHEN cust.ship_to_state IN ('MB','NT','NU','SK','AB','AK','BC','HI','ID','MT','OR','WA','WY','YT')
+                THEN 'Northwest'
+            WHEN cust.ship_to_state IN ('AL','FL','GA','MS','NC','SC')
+                THEN 'Southeast'
+            WHEN cust.ship_to_state IN ('AZ','CA','CO','NM','NV','UT')
+                THEN 'Southwest'
+            WHEN cust.ship_to_state = 'TX'
+                THEN 'Texas'
+            ELSE 'Other' END AS "Territory"
+FROM cms
+  INNER JOIN fx on fx.conv_date = cms.gl_date
+  INNER JOIN cust on cust.site_use_id = cms.ship_to_site_use_id
+  INNER JOIN oot on cms.order_type_id = oot.transaction_type_id
+  INNER JOIN apps.ra_customer_trx_lines_all trxl ON cms.customer_trx_line_id = trxl.customer_trx_line_id
+                                              AND cms.inventory_item_id = trxl.inventory_item_id
+ INNER JOIN msi on cms.inventory_item_id = msi.inventory_item_id
+                 AND cms.parent_organization_id = msi.organization_id
